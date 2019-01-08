@@ -378,13 +378,24 @@ static const uint8_t* v4l2_query_buffers(int fd)
         struct v4l2_requestbuffers requestbuffers;
         struct v4l2_buffer buffer;
 
-#if 0
+#if defined(SET_MJPG_FORMAT)
         struct v4l2_format format;
         memset(&format, 0, sizeof(format));
         format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         format.fmt.pix.width = 1280;
         format.fmt.pix.height = 720;
         format.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        if (-1 == ioctl(fd, VIDIOC_S_FMT, &format)) {
+            fprintf(stderr, "VIDIOC_S_FMT failed: %s\n", strerror(errno));
+            break;
+        }
+#elif defined(SET_YUYV_FORMAT)
+        struct v4l2_format format;
+        memset(&format, 0, sizeof(format));
+        format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        format.fmt.pix.width = 1280;
+        format.fmt.pix.height = 720;
+        format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
         if (-1 == ioctl(fd, VIDIOC_S_FMT, &format)) {
             fprintf(stderr, "VIDIOC_S_FMT failed: %s\n", strerror(errno));
             break;
@@ -450,7 +461,7 @@ static void v4l2_store_frame(const uint8_t* image, size_t size, int counter)
         if ((size_t)n >= sizeof(image_filename))
             break;
 
-        fd = open(image_filename, O_WRONLY | O_CREAT, 0664);
+        fd = open(image_filename, O_WRONLY | O_CREAT | O_TRUNC, 0664);
         if (-1 == fd){
             fprintf(stderr, "cannot open '%s': %s\n", image_filename, strerror(errno));
             break;
