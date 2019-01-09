@@ -46,6 +46,13 @@
 /*===========================================================================*\
  * local type definitions
 \*===========================================================================*/
+struct v4l2_buffer_descriptor
+{
+    int index;
+    void* addr;
+    size_t size;
+    uint32_t offset;
+};
 
 /*===========================================================================*\
  * global object definitions
@@ -62,14 +69,16 @@ static void v4l2_print_fmtdesc(struct v4l2_fmtdesc* fmtdesc);
 static void v4l2_print_frmsizeenum(struct v4l2_frmsizeenum* frmsizeenum);
 static void v4l2_print_cropping_capabilities(struct v4l2_cropcap* cropcap);
 static uint32_t v4l2_query_capabilities(int fd);
-static const uint8_t* v4l2_query_buffers(int fd);
+static int v4l2_query_buffers(int fd, int number_of_buffers);
+static int v4l2_queue_buffers(int fd, int number_of_buffers);
+static int v4l2_capture_frame(int fd, void** frame_buffer, size_t* frame_size);
 static void v4l2_store_frame(const uint8_t* image, size_t size, int counter);
-static int v4l2_capture_frame(int fd, size_t* size);
-static int v4l2_video_capture(int fd, const uint8_t* frame_buffer, int number_of_frames);
+static int v4l2_video_capture(int fd, int number_of_frames);
 
 /*===========================================================================*\
  * local object definitions
 \*===========================================================================*/
+struct v4l2_buffer_descriptor* buffer_descriptors;
 
 /*===========================================================================*\
  * inline function definitions
@@ -82,22 +91,27 @@ int main(int argc, char *argv[])
 {
     int fd;
     uint32_t capabilities;
-    const uint8_t* frame_buffer;
     int number_of_frames = 1;
+    int number_of_buffers = 1;
 
     static struct option long_options[] = {
-        {"number-of-frames", required_argument, 0, 'n'},
+        {"number-of-frames",  required_argument, 0, 'n'},
+        {"number-of-buffers", required_argument, 0, 'b'},
         {0, 0, 0, 0}
     };
 
     for (;;) {
-        int c = getopt_long(argc, argv, "n:", long_options, 0);
+        int c = getopt_long(argc, argv, "n:b:", long_options, 0);
         if (-1 == c)
             break;
 
         switch (c) {
             case 'n':
                 number_of_frames = atoi(optarg);
+                break;
+
+            case 'b':
+                number_of_buffers = atoi(optarg);
                 break;
 
             default:
@@ -108,6 +122,9 @@ int main(int argc, char *argv[])
 
     if (number_of_frames < 1)
         number_of_frames = 1;
+
+    if (number_of_buffers < 1)
+        number_of_buffers = 1;
 
     const char* filename = argv[optind];
     if (!filename) {
@@ -130,12 +147,18 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    if (NULL == (frame_buffer = v4l2_query_buffers(fd))) {
+    number_of_buffers = v4l2_query_buffers(fd, number_of_buffers);
+    if (number_of_buffers < 0) {
         fprintf(stderr, "v4l2_query_buffers() failed\n");
         exit(EXIT_FAILURE);
     }
 
-    if (v4l2_video_capture(fd, frame_buffer, number_of_frames)) {
+    if (v4l2_queue_buffers(fd, number_of_buffers)) {
+        fprintf(stderr, "v4l2_queue_buffers() failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (v4l2_video_capture(fd, number_of_frames)) {
         fprintf(stderr, "v4l2_capture_image() failed\n");
         exit(EXIT_FAILURE);
     }
@@ -151,8 +174,9 @@ static void v4l2_print_usage(const char* progname)
 {
     fprintf(stdout, "usage: %s [-n <frames>] <filename>\n", progname);
     fprintf(stdout, " options:\n");
-    fprintf(stdout, "  -n <frames> --number-of-frames=<frames> : number of frames to be captured (default: 1)\n");
-    fprintf(stdout, "  <filename>                              : capture device (e.g. /dev/video0)\n");
+    fprintf(stdout, "  -n <frames>  --number-of-frames=<frames>   : number of frames to be captured (default: 1)\n");
+    fprintf(stdout, "  -b <buffers> --number-of-buffers=<buffers> : number of buffers to be allocated for capturing (default: 1)\n");
+    fprintf(stdout, "  <filename>                                 : capture device (e.g. /dev/video0)\n");
 }
 
 static const char* v4l2_capabilities_to_string(char* buf, size_t size, uint32_t capabilities)
@@ -370,13 +394,13 @@ static uint32_t v4l2_query_capabilities(int fd)
     return capabilities;
 }
 
-static const uint8_t* v4l2_query_buffers(int fd)
+static int v4l2_query_buffers(int fd, int number_of_buffers)
 {
-    const uint8_t* frame_buffer = NULL;
+    int retval = -1;
 
     do {
         struct v4l2_requestbuffers requestbuffers;
-        struct v4l2_buffer buffer;
+        uint32_t i;
 
 #if defined(SET_MJPG_FORMAT)
         struct v4l2_format format;
@@ -403,7 +427,7 @@ static const uint8_t* v4l2_query_buffers(int fd)
 #endif
 
         memset(&requestbuffers, 0, sizeof(requestbuffers));
-        requestbuffers.count = 1;
+        requestbuffers.count = number_of_buffers;
         requestbuffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         requestbuffers.memory = V4L2_MEMORY_MMAP;
 
@@ -414,37 +438,151 @@ static const uint8_t* v4l2_query_buffers(int fd)
 
         fprintf(stdout,
             "VIDIOC_REQBUFS:\n"
-            "\tcount: %u\n",
-            requestbuffers.count
+            "\trequested count: %u, commited count: %u\n",
+            number_of_buffers, requestbuffers.count
             );
 
+        buffer_descriptors = calloc(requestbuffers.count, sizeof(*buffer_descriptors));
+        if (NULL == buffer_descriptors) {
+            fprintf(stderr, "calloc(%u, %zu) failed\n",
+                requestbuffers.count, sizeof(*buffer_descriptors));
+            break;
+        }
+
+        for (i = 0; i < requestbuffers.count; ++i) {
+            struct v4l2_buffer buffer;
+            struct v4l2_buffer_descriptor* bd;
+            void* addr;
+
+            memset(&buffer, 0, sizeof(buffer));
+            buffer.index = i;
+            buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buffer.memory = V4L2_MEMORY_MMAP;
+            if(-1 == ioctl(fd, VIDIOC_QUERYBUF, &buffer)) {
+                fprintf(stderr, "VIDIOC_QUERYBUF[%d] failed: %s\n", i, strerror(errno));
+                break;
+            }
+
+            fprintf(stdout,
+                "VIDIOC_QUERYBUF[%u]:\n"
+                "\tlength: %u, offset: %u\n",
+                i, buffer.length, buffer.m.offset
+                );
+
+            addr = mmap(
+                NULL, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buffer.m.offset);
+            if (MAP_FAILED == addr) {
+                fprintf(stderr, "mmap() failed: %s\n", strerror(errno));
+                break;
+            }
+
+            bd = buffer_descriptors + i;
+            bd->index = i;
+            bd->addr = addr;
+            bd->size = buffer.length;
+            bd->offset = buffer.m.offset;
+        }
+
+        if (i < requestbuffers.count)
+            break;
+
+        retval = requestbuffers.count;
+    } while (0);
+
+    return retval;
+}
+
+static int v4l2_queue_buffers(int fd, int number_of_buffers)
+{
+    int retval = -1;
+
+    do {
+        int i;
+
+        for (i = 0; i < number_of_buffers; ++i) {
+            struct v4l2_buffer buffer;
+
+            memset(&buffer, 0, sizeof(buffer));
+            buffer.index = i;
+            buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buffer.memory = V4L2_MEMORY_MMAP;
+            if(-1 == ioctl(fd, VIDIOC_QBUF, &buffer)) {
+                fprintf(stderr, "VIDIOC_QBUF[%d] failed: %s\n", i, strerror(errno));
+                break;
+            }
+        }
+
+        if (i < number_of_buffers)
+            break;
+
+        retval = 0;
+    } while (0);
+
+    return retval;
+}
+
+static int v4l2_capture_frame(int fd, void** frame_buffer, size_t* frame_size)
+{
+    int retval = -1;
+
+    do {
+        int status;
+        struct v4l2_buffer buffer;
+        fd_set fds;
+        struct timespec ts;
+        uint32_t index;
+
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+
+        ts.tv_sec = V4l2_SELECT_TIMEOUT_SEC;
+        ts.tv_nsec = 0;
+        status = pselect(fd+1, &fds, NULL, NULL, &ts, NULL);
+        if (-1 == status) {
+            fprintf(stderr, "pselect() failed: %s\n", strerror(errno));
+            break;
+        } else
+        if (0 == status) {
+            fprintf(stderr, "no data within %d seconds, timeout expired\n", V4l2_SELECT_TIMEOUT_SEC);
+            break;
+        }
+
         memset(&buffer, 0, sizeof(buffer));
-        buffer.index = 0;
         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buffer.memory = V4L2_MEMORY_MMAP;
-        if(-1 == ioctl(fd, VIDIOC_QUERYBUF, &buffer)) {
-            fprintf(stderr, "VIDIOC_QUERYBUF failed: %s\n", strerror(errno));
+
+        if(-1 == ioctl(fd, VIDIOC_DQBUF, &buffer)) {
+            fprintf(stderr, "VIDIOC_DQBUF failed: %s\n", strerror(errno));
             break;
         }
 
         fprintf(stdout,
-            "VIDIOC_QUERYBUF:\n"
-            "\tlength: %u\n"
-            "\toffset: %u\n",
-            buffer.length,
-            buffer.m.offset
+            "VIDIOC_DQBUF[%u]:\n"
+            "\tbytesused: %u\n",
+            buffer.index, buffer.bytesused
             );
 
-        frame_buffer = (const uint8_t*)mmap(
-            NULL, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buffer.m.offset);
-        if (MAP_FAILED == frame_buffer) {
-            frame_buffer = NULL;
-            fprintf(stderr, "mmap() failed: %s\n", strerror(errno));
+        index = buffer.index;
+
+        if (frame_buffer)
+            *frame_buffer = buffer_descriptors[index].addr;
+        if (frame_size)
+            *frame_size = buffer.bytesused;
+
+        memset(&buffer, 0, sizeof(buffer));
+        buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buffer.memory = V4L2_MEMORY_MMAP;
+        buffer.index = index;
+
+        if(-1 == ioctl(fd, VIDIOC_QBUF, &buffer)) {
+            fprintf(stderr, "VIDIOC_QBUF failed: %s\n", strerror(errno));
             break;
         }
+
+        retval = 0;
     } while (0);
 
-    return frame_buffer;
+    return retval;
 }
 
 static void v4l2_store_frame(const uint8_t* image, size_t size, int counter)
@@ -471,66 +609,16 @@ static void v4l2_store_frame(const uint8_t* image, size_t size, int counter)
             fprintf(stderr, "write() failed: %s\n", strerror(errno));
             break;
         }
-
-        fprintf(stdout, "'%s', size: %zu\n", image_filename, size);
     } while (0);
 
     if (fd != -1)
         close(fd);
 }
 
-static int v4l2_capture_frame(int fd, size_t* size)
-{
-    int retval = -1;
-
-    do {
-        int status;
-        struct v4l2_buffer buffer;
-        fd_set fds;
-        struct timespec ts;
-
-        memset(&buffer, 0, sizeof(buffer));
-        buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP;
-        buffer.index = 0;
-
-        if(-1 == ioctl(fd, VIDIOC_QBUF, &buffer)) {
-            fprintf(stderr, "VIDIOC_QBUF failed: %s\n", strerror(errno));
-            break;
-        }
-
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-
-        ts.tv_sec = V4l2_SELECT_TIMEOUT_SEC;
-        ts.tv_nsec = 0;
-        status = pselect(fd+1, &fds, NULL, NULL, &ts, NULL);
-        if (-1 == status) {
-            fprintf(stderr, "pselect() failed: %s\n", strerror(errno));
-            break;
-        } else
-        if (0 == status) {
-            fprintf(stderr, "no data within %d seconds, timeout expired\n", V4l2_SELECT_TIMEOUT_SEC);
-            break;
-        }
-
-        if(-1 == ioctl(fd, VIDIOC_DQBUF, &buffer)) {
-            fprintf(stderr, "VIDIOC_DQBUF failed: %s\n", strerror(errno));
-            break;
-        }
-
-        if (size)
-            *size = buffer.bytesused;
-
-        retval = 0;
-    } while (0);
-
-    return retval;
-}
-
-static int v4l2_video_capture(int fd, const uint8_t* frame_buffer, int number_of_frames)
+static int v4l2_video_capture(int fd, int number_of_frames)
 {
     uint32_t type;
+    void* frame_buffer;
     size_t frame_size;
     int i;
 
@@ -542,7 +630,7 @@ static int v4l2_video_capture(int fd, const uint8_t* frame_buffer, int number_of
     }
 
     for (i = 0; i < number_of_frames; ++i)
-        if (0 == v4l2_capture_frame(fd, &frame_size))
+        if (0 == v4l2_capture_frame(fd, &frame_buffer, &frame_size))
             v4l2_store_frame(frame_buffer, frame_size, i + 1);
 
     if(-1 == ioctl(fd, VIDIOC_STREAMOFF, &type)) {
