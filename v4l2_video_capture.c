@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -64,21 +65,26 @@ struct v4l2_buffer_descriptor
 static void v4l2_print_usage(const char* progname);
 static const char* v4l2_capabilities_to_string(char* buf, size_t size, uint32_t capabilities);
 static const char* v4l2_buf_type_to_string(enum v4l2_buf_type buf_type);
-static void v4l2_print_capabilities(struct v4l2_capability* caps);
-static void v4l2_print_fmtdesc(struct v4l2_fmtdesc* fmtdesc);
-static void v4l2_print_frmsizeenum(struct v4l2_frmsizeenum* frmsizeenum);
-static void v4l2_print_cropping_capabilities(struct v4l2_cropcap* cropcap);
-static uint32_t v4l2_query_capabilities(int fd);
+static const char* v4l2_frmsizetype_to_string(enum v4l2_frmsizetypes type);
+static const char* v4l2_frmivaltype_to_string(enum v4l2_frmivaltypes type);
+static void v4l2_print_capabilities(const struct v4l2_capability* caps);
+static void v4l2_print_fmtdesc(const struct v4l2_fmtdesc* fmtdesc);
+static void v4l2_print_frmsizeenum(const struct v4l2_frmsizeenum* frmsizeenum);
+static void v4l2_print_frmivalenum(const struct v4l2_frmivalenum* frmivalenum);
+static void v4l2_print_cropping_capabilities(const struct v4l2_cropcap* cropcap);
+static void v4l2_print_format(const struct v4l2_format* format);
+static uint32_t v4l2_query_capabilities(int fd, uint32_t flags);
 static int v4l2_query_buffers(int fd, int number_of_buffers);
 static int v4l2_queue_buffers(int fd, int number_of_buffers);
 static int v4l2_capture_frame(int fd, void** frame_buffer, size_t* frame_size);
-static void v4l2_store_frame(const uint8_t* image, size_t size, int counter);
+static void v4l2_store_frame(const uint8_t* image, uint32_t fourcc, size_t size, int counter);
 static int v4l2_video_capture(int fd, int number_of_frames);
 
 /*===========================================================================*\
  * local object definitions
 \*===========================================================================*/
-struct v4l2_buffer_descriptor* buffer_descriptors;
+static struct v4l2_format selected_format;
+static struct v4l2_buffer_descriptor* buffer_descriptors;
 
 /*===========================================================================*\
  * inline function definitions
@@ -93,15 +99,17 @@ int main(int argc, char *argv[])
     uint32_t capabilities;
     int number_of_frames = 1;
     int number_of_buffers = 1;
+    bool use_compressed_formats = false;
 
     static struct option long_options[] = {
-        {"number-of-frames",  required_argument, 0, 'n'},
-        {"number-of-buffers", required_argument, 0, 'b'},
+        {"number-of-frames",       required_argument, 0, 'n'},
+        {"number-of-buffers",      required_argument, 0, 'b'},
+        {"use-compressed-formats", no_argument,       0, 'c'},
         {0, 0, 0, 0}
     };
 
     for (;;) {
-        int c = getopt_long(argc, argv, "n:b:", long_options, 0);
+        int c = getopt_long(argc, argv, "n:b:c", long_options, 0);
         if (-1 == c)
             break;
 
@@ -112,6 +120,10 @@ int main(int argc, char *argv[])
 
             case 'b':
                 number_of_buffers = atoi(optarg);
+                break;
+
+            case 'c':
+                use_compressed_formats = true;
                 break;
 
             default:
@@ -140,10 +152,24 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    capabilities = v4l2_query_capabilities(fd);
+    memset(&selected_format, 0, sizeof(selected_format));
+
+    capabilities = v4l2_query_capabilities(fd, use_compressed_formats ? V4L2_FMT_FLAG_COMPRESSED : 0);
     if (!(capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
         !(capabilities & V4L2_CAP_STREAMING)) {
-        fprintf(stderr, "%s do not support video capture and streaming\n", filename);
+        fprintf(stderr, "%s do not support video capture or streaming\n", filename);
+        exit(EXIT_FAILURE);
+    }
+
+    if (selected_format.type == 0) {
+        fprintf(stderr, "No frame format is selected for capturing\n");
+        exit(EXIT_FAILURE);
+    }
+
+    v4l2_print_format(&selected_format);
+
+    if (-1 == ioctl(fd, VIDIOC_S_FMT, &selected_format)) {
+        fprintf(stderr, "VIDIOC_S_FMT failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
@@ -176,7 +202,8 @@ static void v4l2_print_usage(const char* progname)
     fprintf(stdout, " options:\n");
     fprintf(stdout, "  -n <frames>  --number-of-frames=<frames>   : number of frames to be captured (default: 1)\n");
     fprintf(stdout, "  -b <buffers> --number-of-buffers=<buffers> : number of buffers to be allocated for capturing (default: 1)\n");
-    fprintf(stdout, "  <filename>                                 : capture device (e.g. /dev/video0)\n");
+    fprintf(stdout, "  -c --use-compressed-formats                : if set, capturing will search for compressed formats\n");
+    fprintf(stdout, "  <filename>                                 : capturing device (e.g. /dev/video0)\n");
 }
 
 static const char* v4l2_capabilities_to_string(char* buf, size_t size, uint32_t capabilities)
@@ -209,11 +236,11 @@ static const char* v4l2_capabilities_to_string(char* buf, size_t size, uint32_t 
         "V4L2_CAP_SDR_CAPTURE",
         "V4L2_CAP_EXT_PIX_FORMAT",
         "V4L2_CAP_SDR_OUTPUT",
-        "UNKNOWN_0x00800000",
+        "V4L2_CAP_META_CAPTURE",
         "V4L2_CAP_READWRITE",
         "V4L2_CAP_ASYNCIO",
         "V4L2_CAP_STREAMING",
-        "UNKNOWN_0x08000000",
+        "V4L2_CAP_META_OUTPUT",
         "V4L2_CAP_TOUCH",
         "UNKNOWN_0x20000000",
         "UNKNOWN_0x40000000",
@@ -254,13 +281,43 @@ static const char* v4l2_buf_type_to_string(enum v4l2_buf_type buf_type)
         [V4L2_BUF_TYPE_SDR_OUTPUT]           = "V4L2_BUF_TYPE_SDR_OUTPUT",
     };
 
-    if (buf_type > V4L2_BUF_TYPE_SDR_OUTPUT)
+    if (buf_type > (sizeof(buf_types) / sizeof(buf_types[0])))
         buf_type = 0;
 
     return buf_types[buf_type];
 }
 
-static void v4l2_print_capabilities(struct v4l2_capability* caps)
+static const char* v4l2_frmsizetype_to_string(enum v4l2_frmsizetypes type)
+{
+    static const char* types[] = {
+        [0]                              = "0",
+        [V4L2_FRMSIZE_TYPE_DISCRETE]     = "V4L2_FRMSIZE_TYPE_DISCRETE",
+        [V4L2_FRMSIZE_TYPE_CONTINUOUS]   = "V4L2_FRMSIZE_TYPE_CONTINUOUS",
+        [V4L2_FRMSIZE_TYPE_STEPWISE]     = "V4L2_FRMSIZE_TYPE_STEPWISE",
+    };
+
+    if (type >= (sizeof(types) / sizeof(types[0])))
+        type = 0;
+
+    return types[type];
+}
+
+static const char* v4l2_frmivaltype_to_string(enum v4l2_frmivaltypes type)
+{
+    static const char* types[] = {
+        [0]                              = "0",
+        [V4L2_FRMIVAL_TYPE_DISCRETE]     = "V4L2_FRMIVAL_TYPE_DISCRETE",
+        [V4L2_FRMIVAL_TYPE_CONTINUOUS]   = "V4L2_FRMIVAL_TYPE_CONTINUOUS",
+        [V4L2_FRMIVAL_TYPE_STEPWISE]     = "V4L2_FRMIVAL_TYPE_STEPWISE",
+    };
+
+    if (type >= (sizeof(types) / sizeof(types[0])))
+        type = 0;
+
+    return types[type];
+}
+
+static void v4l2_print_capabilities(const struct v4l2_capability* caps)
 {
     char buf1[1024];
     char buf2[1024];
@@ -286,7 +343,7 @@ static void v4l2_print_capabilities(struct v4l2_capability* caps)
         );
 }
 
-static void v4l2_print_fmtdesc(struct v4l2_fmtdesc* fmtdesc)
+static void v4l2_print_fmtdesc(const struct v4l2_fmtdesc* fmtdesc)
 {
     fprintf(stdout,
         "VIDIOC_ENUM_FMT:\n"
@@ -306,26 +363,77 @@ static void v4l2_print_fmtdesc(struct v4l2_fmtdesc* fmtdesc)
         );
 }
 
-static void v4l2_print_frmsizeenum(struct v4l2_frmsizeenum* frmsizeenum)
+static void v4l2_print_frmsizeenum(const struct v4l2_frmsizeenum* frmsizeenum)
 {
     fprintf(stdout,
         "\tVIDIOC_ENUM_FRAMESIZES:\n"
         "\t\tindex       : %u\n"
         "\t\tpixelformat : '%c%c%c%c'\n"
-        "\t\ttype        : %s\n"
-        "\t\tdiscrete    : width: %u, height: %u\n",
+        "\t\ttype        : %s\n",
         frmsizeenum->index,
         (frmsizeenum->pixel_format >>  0) & 0xff,
         (frmsizeenum->pixel_format >>  8) & 0xff,
         (frmsizeenum->pixel_format >> 16) & 0xff,
         (frmsizeenum->pixel_format >> 24) & 0xff,
-        "V4L2_FRMIVAL_TYPE_DISCRETE",
-        frmsizeenum->discrete.width,
-        frmsizeenum->discrete.height
+        v4l2_frmsizetype_to_string(frmsizeenum->type)
         );
+
+    if (frmsizeenum->type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+        fprintf(stdout,
+            "\t\tdiscrete    : width: %u, height: %u\n",
+            frmsizeenum->discrete.width,
+            frmsizeenum->discrete.height
+            );
+    } else
+    if (frmsizeenum->type == V4L2_FRMSIZE_TYPE_STEPWISE) {
+
+    } else {
+        /* do nothing */
+    }
 }
 
-static void v4l2_print_cropping_capabilities(struct v4l2_cropcap* cropcap)
+static void v4l2_print_frmivalenum(const struct v4l2_frmivalenum* frmivalenum)
+{
+    fprintf(stdout,
+        "\t\tVIDIOC_ENUM_FRAMEINTERVALS:\n"
+        "\t\t\tindex       : %u\n"
+        "\t\t\tpixelformat : '%c%c%c%c'\n"
+        "\t\t\twidth       : %u\n"
+        "\t\t\theight      : %u\n"
+        "\t\t\ttype        : %s\n",
+        frmivalenum->index,
+        (frmivalenum->pixel_format >>  0) & 0xff,
+        (frmivalenum->pixel_format >>  8) & 0xff,
+        (frmivalenum->pixel_format >> 16) & 0xff,
+        (frmivalenum->pixel_format >> 24) & 0xff,
+        frmivalenum->width,
+        frmivalenum->height,
+        v4l2_frmivaltype_to_string(frmivalenum->type)
+        );
+
+        if (frmivalenum->type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+            fprintf(stdout,
+                "\t\t\tdiscrete    : %u/%u\n",
+                frmivalenum->discrete.numerator,
+                frmivalenum->discrete.denominator
+                );
+        } else
+        if (frmivalenum->type == V4L2_FRMSIZE_TYPE_STEPWISE) {
+            fprintf(stdout,
+                "\t\t\tstepwise    : min: %u/%u, max: %u/%u, step: %u/%u\n",
+                frmivalenum->stepwise.min.numerator,
+                frmivalenum->stepwise.min.denominator,
+                frmivalenum->stepwise.max.numerator,
+                frmivalenum->stepwise.max.denominator,
+                frmivalenum->stepwise.step.numerator,
+                frmivalenum->stepwise.step.denominator
+                );
+        } else {
+            /* do nothing */
+        }
+}
+
+static void v4l2_print_cropping_capabilities(const struct v4l2_cropcap* cropcap)
 {
     fprintf(stdout,
         "VIDIOC_CROPCAP:\n"
@@ -338,7 +446,24 @@ static void v4l2_print_cropping_capabilities(struct v4l2_cropcap* cropcap)
         );
 }
 
-static uint32_t v4l2_query_capabilities(int fd)
+static void v4l2_print_format(const struct v4l2_format* format)
+{
+    fprintf(stdout,
+        "selected frame format:\n"
+        "\ttype        : %s\n"
+        "\tdiscrete    : width: %u, height: %u\n"
+        "\tpixelformat : '%c%c%c%c'\n",
+        v4l2_buf_type_to_string(format->type),
+        format->fmt.pix.width,
+        format->fmt.pix.height,
+        (format->fmt.pix.pixelformat >>  0) & 0xff,
+        (format->fmt.pix.pixelformat >>  8) & 0xff,
+        (format->fmt.pix.pixelformat >> 16) & 0xff,
+        (format->fmt.pix.pixelformat >> 24) & 0xff
+        );
+}
+
+static uint32_t v4l2_query_capabilities(int fd, uint32_t flags)
 {
     uint32_t capabilities = 0;
 
@@ -348,6 +473,7 @@ static uint32_t v4l2_query_capabilities(int fd)
         struct v4l2_fmtdesc fmtdesc;
         struct v4l2_cropcap cropcap;
         struct v4l2_frmsizeenum frmsizeenum;
+        struct v4l2_frmivalenum frmivalenum;
 
         memset(&caps, 0, sizeof(caps));
         status = ioctl(fd, VIDIOC_QUERYCAP, &caps);
@@ -362,17 +488,35 @@ static uint32_t v4l2_query_capabilities(int fd)
         memset(&fmtdesc, 0, sizeof(fmtdesc));
         fmtdesc.index = 0;
         fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        while (0 == (status = ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc))) {
-            fmtdesc.index++;
+        for (; 0 == (status = ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc)); fmtdesc.index++) {
             v4l2_print_fmtdesc(&fmtdesc);
 
             memset(&frmsizeenum, 0, sizeof(frmsizeenum));
             frmsizeenum.index = 0;
             frmsizeenum.pixel_format = fmtdesc.pixelformat;
-            while (0 == (status = ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsizeenum))) {
-                frmsizeenum.index++;
-                if (V4L2_FRMIVAL_TYPE_DISCRETE == frmsizeenum.type)
+            for (; 0 == (status = ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsizeenum)); frmsizeenum.index++) {
+                if (V4L2_FRMSIZE_TYPE_DISCRETE == frmsizeenum.type) {
                     v4l2_print_frmsizeenum(&frmsizeenum);
+
+                    if (selected_format.type == 0) {
+                        if ((flags ^ fmtdesc.flags) == 0) {
+                            selected_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                            selected_format.fmt.pix.width = frmsizeenum.discrete.width;
+                            selected_format.fmt.pix.height = frmsizeenum.discrete.height;
+                            selected_format.fmt.pix.pixelformat = frmsizeenum.pixel_format;
+                        }
+                    }
+
+                    memset(&frmivalenum, 0, sizeof(frmivalenum));
+                    frmivalenum.index = 0;
+                    frmivalenum.pixel_format = frmsizeenum.pixel_format;
+                    frmivalenum.width = frmsizeenum.discrete.width;
+                    frmivalenum.height = frmsizeenum.discrete.height;
+                    for (; 0 == (status = ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmivalenum)); frmivalenum.index++)
+                        v4l2_print_frmivalenum(&frmivalenum);
+                    if (-1 == status && errno != EINVAL)
+                        fprintf(stderr, "VIDIOC_ENUM_FRAMEINTERVALS failed: %s\n", strerror(errno));
+                }
             }
             if (-1 == status && errno != EINVAL)
                 fprintf(stderr, "VIDIOC_ENUM_FRAMESIZES failed: %s\n", strerror(errno));
@@ -382,7 +526,7 @@ static uint32_t v4l2_query_capabilities(int fd)
 
         memset(&cropcap, 0, sizeof(cropcap));
         cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        status = ioctl (fd, VIDIOC_CROPCAP, &cropcap);
+        status = ioctl(fd, VIDIOC_CROPCAP, &cropcap);
         if (-1 == status) {
             fprintf(stderr, "VIDIOC_CROPCAP failed: %s\n", strerror(errno));
             break;
@@ -401,30 +545,6 @@ static int v4l2_query_buffers(int fd, int number_of_buffers)
     do {
         struct v4l2_requestbuffers requestbuffers;
         uint32_t i;
-
-#if defined(SET_MJPG_FORMAT)
-        struct v4l2_format format;
-        memset(&format, 0, sizeof(format));
-        format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        format.fmt.pix.width = 1280;
-        format.fmt.pix.height = 720;
-        format.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-        if (-1 == ioctl(fd, VIDIOC_S_FMT, &format)) {
-            fprintf(stderr, "VIDIOC_S_FMT failed: %s\n", strerror(errno));
-            break;
-        }
-#elif defined(SET_YUYV_FORMAT)
-        struct v4l2_format format;
-        memset(&format, 0, sizeof(format));
-        format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        format.fmt.pix.width = 1280;
-        format.fmt.pix.height = 720;
-        format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-        if (-1 == ioctl(fd, VIDIOC_S_FMT, &format)) {
-            fprintf(stderr, "VIDIOC_S_FMT failed: %s\n", strerror(errno));
-            break;
-        }
-#endif
 
         memset(&requestbuffers, 0, sizeof(requestbuffers));
         requestbuffers.count = number_of_buffers;
@@ -585,7 +705,7 @@ static int v4l2_capture_frame(int fd, void** frame_buffer, size_t* frame_size)
     return retval;
 }
 
-static void v4l2_store_frame(const uint8_t* image, size_t size, int counter)
+static void v4l2_store_frame(const uint8_t* image, uint32_t fourcc, size_t size, int counter)
 {
     char image_filename[256];
     int fd = -1;
@@ -593,7 +713,14 @@ static void v4l2_store_frame(const uint8_t* image, size_t size, int counter)
     do {
         int n;
 
-        n = snprintf(image_filename, sizeof(image_filename), "image%04d.jpg", counter);
+        n = snprintf(image_filename, sizeof(image_filename), "image%04d.%c%c%c%c",
+            counter,
+            (fourcc >>  0) & 0xff,
+            (fourcc >>  8) & 0xff,
+            (fourcc >> 16) & 0xff,
+            (fourcc >> 24) & 0xff
+        );
+
         if (n < 0)
             break;
         if ((size_t)n >= sizeof(image_filename))
@@ -631,7 +758,7 @@ static int v4l2_video_capture(int fd, int number_of_frames)
 
     for (i = 0; i < number_of_frames; ++i)
         if (0 == v4l2_capture_frame(fd, &frame_buffer, &frame_size))
-            v4l2_store_frame(frame_buffer, frame_size, i + 1);
+            v4l2_store_frame(frame_buffer, selected_format.fmt.pix.pixelformat, frame_size, i + 1);
 
     if(-1 == ioctl(fd, VIDIOC_STREAMOFF, &type)) {
         fprintf(stderr, "VIDIOC_STREAMOFF failed: %s\n", strerror(errno));
