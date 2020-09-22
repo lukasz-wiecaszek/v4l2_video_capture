@@ -42,7 +42,7 @@
 /*===========================================================================*\
  * preprocessor #define constants and macros
 \*===========================================================================*/
-#define V4l2_SELECT_TIMEOUT_SEC 2
+#define V4l2_SELECT_TIMEOUT_SEC 10
 
 /*===========================================================================*\
  * local type definitions
@@ -198,7 +198,7 @@ int main(int argc, char *argv[])
 \*===========================================================================*/
 static void v4l2_print_usage(const char* progname)
 {
-    fprintf(stdout, "usage: %s [-n <frames>] <filename>\n", progname);
+    fprintf(stdout, "usage: %s [-n <frames>] [-b <buffers>] [-c] <filename>\n", progname);
     fprintf(stdout, " options:\n");
     fprintf(stdout, "  -n <frames>  --number-of-frames=<frames>   : number of frames to be captured (default: 1)\n");
     fprintf(stdout, "  -b <buffers> --number-of-buffers=<buffers> : number of buffers to be allocated for capturing (default: 1)\n");
